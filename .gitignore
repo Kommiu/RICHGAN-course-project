@@ -1,0 +1,5 @@
+data_root/
+data_csv/
+*.tgz
+.ipynb_checkpoints/*
+venv/
