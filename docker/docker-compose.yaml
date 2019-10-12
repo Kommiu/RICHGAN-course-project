@@ -1,0 +1,23 @@
+version: '2'
+services:
+    richgan:
+        image: richgan
+        cpuset: "0,1,2,3,4,5"
+        container_name: richgan
+        environment:
+            - TZ=MSK
+            - DISPLAY=$DISPLAY
+            - PASSWORD=$JUPYTER_PASSWORD
+            - NVIDIA_VISIBLE_DEVICES=0,1
+        mem_limit: 23g
+        memswap_limit: 1
+        ports:
+            - "8003:8888"
+            - "8002:6006"
+        volumes:
+            - /home/rvmisyutin/Projects/richgan/:/app
+            - /media/megatron/rvmisyutin/richgan:/_data
+        ipc: host
+        shm_size: 8G
+        command: /bin/bash -c "cd / && jupyter notebook --allow-root --ip=0.0.0.0"
+        restart: unless-stopped
