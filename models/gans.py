@@ -1,30 +1,15 @@
-from abc import abstractmethod
-
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.utils.data as data
-import torch.autograd as autograd
+from torch.autograd import grad
+
 from tqdm.auto import trange, tqdm
 
-import libs.collections as lc
-from libs.metrics import score_func
-from libs.utils import compute_grad_norm
 
-
-class NoGrad:
-    def __init__(self, *modules):
-        self.modules = modules
-
-    def __enter__(self):
-        for m in self.modules:
-            for p in m.parameters():
-                p.requires_grad = False
-
-    def __exit__(self, type, value, traceback):
-        for m in self.modules:
-            for p in m.parameters():
-                p.requires_grad = True
+import lib.collections as lc
+from lib.utils import score_func, NoGrad
+from lib.utils import compute_grad_norm, plot_hist
 
 
 class MLPGenerator(nn.Module):
@@ -72,6 +57,7 @@ class MLPDiscriminator(nn.Module):
             target_dim,
             condition_dim,
             hidden_dims,
+            output_dim=1,
             activation=nn.LeakyReLU(0.2, inplace=True)
     ):
         super().__init__()
@@ -94,7 +80,7 @@ class MLPDiscriminator(nn.Module):
                     )
                 )
         self.net.add_module(
-            'logits', nn.Linear(hidden_dims[-1], 1)
+            'logits', nn.Linear(hidden_dims[-1], output_dim)
         )
 
     def forward(self, X, C):
@@ -110,17 +96,12 @@ class GAN:
             discriminator,
             generator_opt,
             discriminator_opt,
-            relativistic=None,
-            smooth_labels=None,
-            flip_labels=None
+
     ):
         self.generator = generator
         self.discriminator = discriminator
         self.generator_opt = generator_opt
         self.discriminator_opt = discriminator_opt
-        self.relativistic = relativistic
-        self.smooth_labels = smooth_labels
-        self.flip_labels = flip_labels
         assert next(self.generator.parameters()).device == next(self.discriminator.parameters()).device
         self.device = next(self.generator.parameters()).device
 
@@ -136,7 +117,7 @@ class GAN:
         )
         return dataloader
 
-    def score(self, dataloader, tqdm=None, n_slises=300):
+    def test(self, dataloader, tqdm=None, plot_dists=False, n_slises=300):
         reference = []
         generated = []
         with torch.no_grad():
@@ -150,7 +131,14 @@ class GAN:
 
         reference = torch.cat(reference, dim=0).numpy()
         generated = torch.cat(generated, dim=0).numpy()
-        return score_func(reference, generated, n_slises)
+        if plot_dists:
+            figs = list()
+            for i in range(X.size(1)):
+                figs.append(plot_hist(reference[:, i], generated[:, i]))
+        else:
+            figs = None
+
+        return score_func(reference, generated, n_slises), figs
 
     def train(
             self,
@@ -161,6 +149,7 @@ class GAN:
             writer=None,
             test_freq=1,
             log_grad_norms=False,
+            plot_dists=False
     ):
 
         epoch_tqdm = trange(start_epoch, start_epoch + num_epochs)
@@ -184,64 +173,72 @@ class GAN:
                 d_loss, d_grad_norms = self.train_discriminator(
                     X,
                     C,
-                    real_labels,
-                    fake_labels,
                     log_grad_norms,
                 )
                 d_loss_sum += d_loss * len(X)
                 d_loss_count += len(X)
                 step = epoch * len(dataloaders['train']) + i
                 if log_grad_norms:
-                    writer.add_scalar('discriminator grad norms', d_grad_norms, global_step=step)
+                    writer.add_scalar('grads/discriminator grad norms', d_grad_norms, global_step=step)
 
                 if i % n_critic == 0:
                     g_loss, g_grad_norms = self.train_generator(
                         X,
                         C,
-                        real_labels,
                         log_grad_norms
                     )
-                    print(g_loss)
                     g_loss_sum += g_loss*len(X)
                     g_loss_count += len(X)
                     if log_grad_norms:
-                        writer.add_scalar('generator grad norms', g_grad_norms, global_step=step)
+                        writer.add_scalar('grads/generator grad norms', g_grad_norms, global_step=step)
 
                 batch_tqdm['train'].update()
 
             score = None
+            figs =  None
             if 'test' in dataloaders and (epoch - start_epoch) % test_freq == 0:
-                score = self.score(dataloaders['test'], tqdm=batch_tqdm['test'])
-                print('Epoch ', epoch, 'score: ', score)
+                score, figs = self.test(dataloaders['test'], tqdm=batch_tqdm['test'], plot_dists=plot_dists)
 
             if writer is not None:
-                writer.add_scalar('generator loss', np.mean(g_loss_sum/g_loss_count), global_step=epoch)
-                writer.add_scalar('disciminator loss', np.mean(d_loss_sum/d_loss_count), global_step=epoch)
+                writer.add_scalar('loss/generator loss', np.mean(g_loss_sum/g_loss_count), global_step=epoch)
+                writer.add_scalar('loss/disciminator loss', np.mean(d_loss_sum/d_loss_count), global_step=epoch)
                 if score is not None:
                     writer.add_scalar('KS-score', score, global_step=epoch)
+                if figs is not None:
+                    for i, fig in enumerate(figs):
+                        writer.add_figure(f'column-{i}', fig, global_step=epoch)
             for t in batch_tqdm.values():
                 t.reset()
 
     def generate(self, C):
-        Z = torch.randn(len(C), self.generator.latent_dim, device=self.device, dtype=torch.float)
-        with torch.no_grad():
-            X = self.generator(Z, C.to(self.device))
-        return X
 
-    # @abstractmethod
-    # def train_generator(self):
-    #     return
-    #
-    # @abstractmethod
-    # def train_discriminator(self):
-    #     return
+        Z = torch.randn(len(C), self.generator.latent_dim, device=self.device, dtype=torch.float)
+        C = torch.from_numpy(C).float().to(self.device)
+        with torch.no_grad():
+            X = self.generator(Z, C)
+        return X.cpu().numpy()
 
 
 class CGAN(GAN):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.adversarial_loss = nn.BCEWithLogitsLoss()
+    def __init__(
+            self,
+            generator,
+            discriminator,
+            generator_opt,
+            discriminator_opt,
+            relativistic=None,
+            smooth_labels=None,
+            flip_labels=None,
+            generator_loss=nn.BCEWithLogitsLoss(),
+            discriminator_loss=nn.BCEWithLogitsLoss(),
+    ):
+        super().__init__(generator, discriminator, generator_opt, discriminator_opt)
+        self.relativistic = relativistic
+        self.smooth_labels = smooth_labels
+        self.flip_labels = flip_labels
+        self.generator_loss = generator_loss
+        self.discriminator_loss = discriminator_loss
 
     def train_generator(self, real_batch, conditions, log_grad_norms):
         b_size = len(real_batch)
@@ -250,14 +247,15 @@ class CGAN(GAN):
         self.generator_opt.zero_grad()
         z = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
         fake_batch = self.generator(z, conditions)
-        validity = self.discriminator(fake_batch, conditions)
-        g_loss = self.adversarial_loss(validity, real_labels)
+        with NoGrad(self.discriminator):
+            validity = self.discriminator(fake_batch, conditions)
+        g_loss = self.generator_loss(validity, real_labels)
         g_loss.backward()
         self.generator_opt.step()
         if log_grad_norms:
             return g_loss.item(), compute_grad_norm(self.generator)
         else:
-            return g_loss.item()
+            return g_loss.item(), None
 
     def train_discriminator(self, real_batch, conditions, log_grad_norms):
 
@@ -270,9 +268,9 @@ class CGAN(GAN):
 
         if self.flip_labels is not None:
             real_mask = torch.from_numpy(np.random.binomial(1, 1 - self.flip_labels[0], len(real_labels))).float().to(
-                self.device)
+                self.device).view(-1, 1)
             fake_mask = torch.from_numpy(np.random.binomial(1, 1 - self.flip_labels[1], len(fake_labels))).float().to(
-                self.device)
+                self.device).view(-1, 1)
             new_real_labels = real_mask * real_labels + (1 - real_mask) * fake_labels
             new_fake_labels = fake_mask * fake_labels + (1 - fake_mask) * real_labels
             real_labels = new_real_labels
@@ -282,20 +280,19 @@ class CGAN(GAN):
 
         validity_real = self.discriminator(real_batch, conditions)
         with torch.no_grad():
-            z = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=device)
+            z = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
             fake_batch = self.generator(z, conditions)
         validity_fake = self.discriminator(fake_batch, conditions)
-
         if self.relativistic is not None:
             if self.relativistic == 'average':
-                d_fake_loss = self.adversarial_loss(validity_fake - validity_real.mean(keep_dims=True), fake_labels)
-                d_real_loss = self.adversarial_loss(validity_real - validity_fake.mean(keep_dims=True), real_labels)
+                d_fake_loss = self.discriminator_loss(validity_fake - validity_real.mean(), fake_labels)
+                d_real_loss = self.discriminator_loss(validity_real - validity_fake.mean(), real_labels)
             else:
-                d_fake_loss = self.adversarial_loss(validity_fake - validity_real, fake_labels)
-                d_real_loss = self.adversarial_loss(validity_real - validity_fake, real_labels)
+                d_fake_loss = self.discriminator_loss(validity_fake - validity_real, fake_labels)
+                d_real_loss = self.discriminator_loss(validity_real - validity_fake, real_labels)
         else:
-            d_fake_loss = self.adversarial_loss(validity_fake, fake_labels)
-            d_real_loss = self.adversarial_loss(validity_real, real_labels)
+            d_fake_loss = self.discriminator_loss(validity_fake, fake_labels)
+            d_real_loss = self.discriminator_loss(validity_real, real_labels)
 
         d_loss = (d_real_loss + d_fake_loss) / 2
         d_loss.backward()
@@ -309,15 +306,21 @@ class CGAN(GAN):
 
 class WGAN(GAN):
 
-    def __init__(self, lambda_gp, *args, **kwargs):
-        super(WGAN, self).__init__(*args, **kwargs)
-        self.adversarial_loss = nn.MSELoss()
+    def __init__(
+            self,
+            generator,
+            discriminator,
+            generator_opt,
+            discriminator_opt,
+            lambda_gp,
+    ):
+        super().__init__(generator, discriminator, generator_opt, discriminator_opt)
         self.lambda_gp = lambda_gp
 
     def _compute_gradient_penalty(self, real_batch, fake_batch, conditions):
         """Calculates the gradient penalty loss for WGAN GP"""
         # Random weight term for interpolation between real and fake samples
-        alpha = torch.rand(len(real_batch), 1)
+        alpha = torch.rand(len(real_batch), 1).to(self.device)
         # Get random interpolation between real and fake samples
         interpolates = (alpha * real_batch + ((1 - alpha) * fake_batch)).requires_grad_(True)
         validity_inter = self.discriminator(interpolates, conditions)
@@ -336,7 +339,7 @@ class WGAN(GAN):
 
         return gradient_penalty
 
-    def train_generator(self, real_batch, conditions, real_labels, log_grad_norms):
+    def train_generator(self, real_batch, conditions, log_grad_norms):
         self.generator_opt.zero_grad()
         b_size = len(real_batch)
         z = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
@@ -344,7 +347,7 @@ class WGAN(GAN):
         with NoGrad(self.discriminator):
             validity = self.discriminator(fake_batch, conditions)
 
-        g_loss = self.generator_loss(validity, real_labels)
+        g_loss = - validity.mean()
         g_loss.backward()
         self.generator_opt.step()
 
@@ -353,18 +356,17 @@ class WGAN(GAN):
         else:
             return g_loss.item(), None
 
-    def train_discriminator(self, real_batch, conditions, real_labels, fake_labels, log_grad_norms):
-        device = next(self.generator.parameters()).device
+    def train_discriminator(self, real_batch, conditions, log_grad_norms):
         b_size = len(real_batch)
         self.discriminator_opt.zero_grad()
 
         validity_real = self.discriminator(real_batch, conditions)
         with torch.no_grad():
-            z = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=device)
+            z = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
             fake_batch = self.generator(z, conditions)
         validity_fake = self.discriminator(fake_batch, conditions)
 
-        gp = self.compute_gradient_penalty(real_batch, fake_batch, conditions, fake_labels)
+        gp = self._compute_gradient_penalty(real_batch, fake_batch, conditions)
 
         d_loss = -validity_real.mean() + validity_fake.mean() + self.lambda_gp*gp
         d_loss.backward()
@@ -374,3 +376,85 @@ class WGAN(GAN):
             return d_loss.item(), compute_grad_norm(self.discriminator)
         else:
             return d_loss.item(), None
+
+
+class CramerGAN(GAN):
+
+    def __init__(
+            self,
+            generator,
+            discriminator,
+            generator_opt,
+            discriminator_opt,
+            lambda_gp,
+            surogate=False,
+    ):
+        super().__init__(generator, discriminator, generator_opt, discriminator_opt)
+        self.lambda_gp = lambda_gp
+        self.surogate = surogate
+
+    def _critic(self, real_batch, fake_batch, conditions):
+
+        validity_real = self.discriminator(real_batch, conditions)
+        validity_fake = self.discriminator(fake_batch, conditions)
+
+        f = torch.norm(validity_real - validity_fake, p=2, dim=-1) - \
+            torch.norm(validity_real, p=2, dim=-1)
+        return f
+
+    def train_generator(self, real_batch, conditions, log_grad_norms):
+        self.generator_opt.zero_grad()
+        b_size = len(real_batch)
+        z1 = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
+        z2 = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
+        fake_batch_1 = self.generator(z1, conditions)
+        fake_batch_2 = self.generator(z2, conditions)
+        with NoGrad(self.discriminator):
+            c1 = self._critic(real_batch, fake_batch_2, conditions)
+            c2 = self._critic(fake_batch_1, fake_batch_2, conditions)
+        g_loss = torch.mean(c1 - c2)
+        g_loss.backward()
+        self.generator_opt.step()
+        if log_grad_norms:
+            return g_loss.item(), compute_grad_norm(self.generator)
+        else:
+            return g_loss.item(), None
+
+    def train_discriminator(self, real_batch, conditions, log_grad_norms=False):
+        self.discriminator_opt.zero_grad()
+        b_size = len(real_batch)
+        with torch.no_grad():
+            z1 = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
+            z2 = torch.randn(b_size, self.generator.latent_dim, dtype=torch.float, device=self.device)
+            fake_batch_1 = self.generator(z1, conditions)
+            fake_batch_2 = self.generator(z2, conditions)
+
+        surrogate = self._critic(real_batch, fake_batch_2, conditions)\
+                    - self._critic(fake_batch_1, fake_batch_2, conditions)
+
+        d_loss = -surrogate.mean() + self.lambda_gp*self._compute_gradient_penalty(real_batch, fake_batch_1, conditions)
+        d_loss.backward()
+        self.discriminator_opt.step()
+
+        if log_grad_norms:
+            return d_loss.item(), compute_grad_norm(self.discriminator)
+        else:
+            return d_loss.item(), None
+
+    def _compute_gradient_penalty(self, real_batch, fake_batch, conditions):
+        b_size = len(real_batch)
+        alpha = torch.rand(b_size, 1, dtype=torch.float, device=self.device)
+        interpolates = alpha*real_batch + (1 - alpha)*fake_batch
+        interpolates.requires_grad_(True)
+        validity_int = self._critic(interpolates, fake_batch, conditions)
+        gradients = grad(
+            outputs=validity_int,
+            inputs=interpolates,
+            grad_outputs=torch.ones(b_size, dtype=torch.float, device=self.device),
+            create_graph=True,
+            retain_graph=True,
+            only_inputs=True,
+        )[0]
+
+        gp = torch.mean((gradients.norm(2, dim=1) - 1)**2)
+        return gp

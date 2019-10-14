@@ -2,10 +2,14 @@ import pandas as pd
 import numpy as np
 
 
-from submissions.model_gan import model, condition_transformer, target_transformer, config
-
 class Model:
-    def __init__(self, simulate_error_codes=True):
+    def __init__(
+            self,
+            model,
+            condition_transformer,
+            target_transformer,
+            simulate_error_codes=True,
+    ):
 
         self.__dict__ = locals()
         self.model = model
@@ -14,7 +18,19 @@ class Model:
         self.simulate_error_codes = simulate_error_codes
         self.condition_columns = ['TrackP', 'TrackEta', 'NumLongTracks']
 
-    def fit(self, conditions, targets):
+    def fit(
+            self,
+            conditions,
+            targets,
+            start_epoch=0,
+            num_epochs=40,
+            n_critic=1,
+            batch_size=512,
+            writer=None,
+            num_workers=4,
+
+    ):
+
         self.target_columns = targets.columns
         conditions = conditions[self.condition_columns]
         if self.simulate_error_codes:
@@ -31,8 +47,19 @@ class Model:
         X = self.target_transformer.fit_transform(targets.values)
         C = self.condition_transformer.fit_transform(conditions.values)
 
-        dataloaders = {'train': self.model.make_dataloader(X, C, **config['dataloader'])}
-        self.model.train(dataloaders, **config['train'])
+        dataloaders = {
+            'train': self.model.make_dataloader(X, C, batch_size=batch_size, num_workers=num_workers)
+        }
+        self.model.train(
+            dataloaders,
+            start_epoch=start_epoch,
+            num_epochs=num_epochs,
+            n_critic=n_critic,
+            writer=writer,
+            log_grad_norms=True,
+            plot_dists=True,
+
+        )
 
     def predict(self, conditions):
         conditions = conditions[self.condition_columns]
@@ -46,6 +73,5 @@ class Model:
 
         result = pd.DataFrame(X, columns=self.target_columns, index=conditions.index)
         return result
-
 
 
