@@ -1,5 +1,5 @@
 ipykernel
-setuptools==41.0.0
+setuptools==65.5.1
 jupyter
 jupyter-client
 jupyter-console
